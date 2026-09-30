@@ -1,0 +1,15 @@
+[package]
+name = "lua-tool"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lua-tool"
+path = "src/main.rs"
+
+[dependencies]
+fyrox.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
