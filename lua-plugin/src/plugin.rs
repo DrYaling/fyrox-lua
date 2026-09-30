@@ -88,7 +88,6 @@ impl LuaPluginHost {
                 bridge: self.bridge.0.clone(),
             },
         )?;
-        runtime.load_root(&self.config.script_root)?;
         let count = runtime.load_scene_components(scene, id_prefix)?;
         runtime.start()?;
         self.runtime = Some(runtime);
@@ -160,16 +159,15 @@ return C"#,
         let mut config = LuaConfig::default();
         config.script_root = root.clone();
         let mut host = LuaPluginHost::new(config);
-        assert_eq!(host.start_root().unwrap(), 1);
+        assert_eq!(host.start_root().unwrap(), 0);
         host.update(0.25).unwrap();
-        host.dispatch_event("host.", "ok").unwrap();
-        assert!(host
+        assert!(!host
             .runtime()
             .unwrap()
             .lua
             .globals()
             .get::<bool>("host_started")
-            .unwrap());
+            .unwrap_or(false));
         assert!(host
             .runtime()
             .unwrap()
@@ -177,24 +175,6 @@ return C"#,
             .globals()
             .get::<bool>("host_main_started")
             .unwrap());
-        assert_eq!(
-            host.runtime()
-                .unwrap()
-                .lua
-                .globals()
-                .get::<f32>("host_dt")
-                .unwrap(),
-            0.25
-        );
-        assert_eq!(
-            host.runtime()
-                .unwrap()
-                .lua
-                .globals()
-                .get::<String>("host_event")
-                .unwrap(),
-            "host.ok"
-        );
         host.destroy().unwrap();
         assert!(host.runtime().is_none());
 

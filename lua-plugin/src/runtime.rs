@@ -3,7 +3,6 @@ use crate::{
     bindings::{register_engine_bindings, register_generated_component_aliases},
     config::{BindingMode, LuaConfig},
     resource::{EditorScript, LuaComponent},
-    script_files::collect_lua_files,
     LuaGameApi,
 };
 use mlua::{Function, Lua, RegistryKey, Table, Value};
@@ -60,6 +59,7 @@ struct ScriptInstance {
     event: Option<RegistryKey>,
     destroy: Option<RegistryKey>,
     scope: Option<HandleToken>,
+    registered_in_main: bool,
 }
 struct MainScript {
     instance: RegistryKey,
@@ -83,17 +83,17 @@ impl PartialEq for LuaRuntime {
 }
 impl LuaRuntime {
     pub fn new(config: LuaConfig, api: impl LuaGameApi) -> mlua::Result<Self> {
-        Self::new_inner(config, api, true)
+        Self::new_inner(config, api)
     }
 
     /// Creates a runtime that combines project scripts (including `main.lua`) with
     /// scene-owned LuaComponent instances in one VM. Root class scripts are loaded
-    /// by `LuaPluginHost::start_scene`; direct callers can opt into them with `new`.
+    /// by `LuaPluginHost::start_scene`.
     pub fn new_for_scene(config: LuaConfig, api: impl LuaGameApi) -> mlua::Result<Self> {
-        Self::new_inner(config, api, false)
+        Self::new_inner(config, api)
     }
 
-    fn new_inner(config: LuaConfig, api: impl LuaGameApi, load_root: bool) -> mlua::Result<Self> {
+    fn new_inner(config: LuaConfig, api: impl LuaGameApi) -> mlua::Result<Self> {
         let root = config.script_root.clone();
         lua_info!(
             "[Lua] runtime initializing (root={}, binding={:?})",
@@ -106,6 +106,11 @@ impl LuaRuntime {
             let path = format!("{}/?.lua;{}/?/init.lua", root.display(), root.display());
             package.set("path", path)?;
         }
+        // `import` is the project-facing spelling for Lua's standard module
+        // loader. It deliberately aliases `require`, so package.loaded caching,
+        // searchers, and errors retain the standard Lua semantics.
+        let require: Function = lua.globals().get("require")?;
+        lua.globals().set("import", require)?;
         // 引擎绑定只从手写注册入口装载；这里绝不扫描 Lua 源码。
         register_engine_bindings(&lua)?;
         lua_info!(
@@ -129,11 +134,9 @@ impl LuaRuntime {
             _main_thread_only: Rc::new(()),
         };
         runtime.load_main(&root)?;
-        if load_root {
-            runtime.load_root(&root)?;
-        }
         lua_info!(
-            "[Lua] runtime initialized with {} script(s)",
+            "[Lua] runtime initialized (main={}, component_instances={})",
+            runtime.main.is_some(),
             runtime.scripts.len()
         );
         Ok(runtime)
@@ -157,39 +160,31 @@ impl LuaRuntime {
     }
     pub fn reload_script(&mut self, path: &Path) -> mlua::Result<()> {
         self.assert_owner_thread();
-        if let Some(i) = self.scripts.iter().position(|entry| entry.path == path) {
+        let register_in_main = if let Some(i) =
+            self.scripts.iter().position(|entry| entry.path == path)
+        {
             let old = self.scripts.remove(i);
+            if old.registered_in_main {
+                self.scripts.insert(i, old);
+                return Err(mlua::Error::runtime(format!(
+                        "cannot reload LuaComponent instance '{}' through load_script; reload the component resource instead",
+                        path.display()
+                    )));
+            }
+            let register_in_main = old.registered_in_main;
             let destroy_result = self.call_no_arg(&old, old.destroy.as_ref());
-            self.remove_script_instance(&old.path)?;
+            if register_in_main {
+                self.remove_script_instance(&old.path)?;
+            }
             self.remove_instance_keys(old)?;
             self.rebuild_update_indices();
             destroy_result?;
-        }
-        self.load_script(path)
+            register_in_main
+        } else {
+            false
+        };
+        self.load_script_with_registration(path, register_in_main)
     }
-    pub fn load_root(&mut self, root: &Path) -> mlua::Result<()> {
-        self.assert_owner_thread();
-        let mut files = vec![];
-        collect_lua_files(root, &mut files);
-        lua_info!(
-            "[Lua] script root '{}': discovered {} file(s)",
-            root.display(),
-            files.len()
-        );
-        if files.is_empty() {
-            lua_warn!("Configured Lua script root is empty: {}", root.display());
-        }
-        for p in files {
-            // 目录中的可复用模块由 Lua `require` 按需加载，不作为场景组件实例化。
-            if p.components().any(|c| c.as_os_str() == "modules") || p == root.join("main.lua") {
-                continue;
-            }
-            self.load_script(&p)?;
-            lua_info!("[Lua] script loaded: {}", p.display());
-        }
-        Ok(())
-    }
-
     /// Loads the optional project entry point. `main.lua` returns a table whose
     /// dot-style lifecycle functions are called in the same VM as component scripts.
     fn load_main(&mut self, root: &Path) -> mlua::Result<()> {
@@ -238,11 +233,29 @@ impl LuaRuntime {
     }
     pub fn load_script(&mut self, p: &Path) -> mlua::Result<()> {
         self.assert_owner_thread();
-        let source = fs::read_to_string(p).map_err(mlua::Error::external)?;
-        self.load_script_source(p, &source, &EditorScript::default())
+        self.load_script_with_registration(p, false)
     }
 
-    /// 从场景 LuaComponent 加载脚本。资源脚本和目录脚本共用同一生命周期实现。
+    fn load_script_with_registration(
+        &mut self,
+        p: &Path,
+        register_in_main: bool,
+    ) -> mlua::Result<()> {
+        let source = fs::read_to_string(p).map_err(mlua::Error::external)?;
+        self.load_script_source_with_components(
+            p,
+            &source,
+            &EditorScript::default(),
+            &Default::default(),
+            None,
+            register_in_main,
+        )
+    }
+
+    /// Explicitly instantiates a script without adding it to `main.scripts`.
+    ///
+    /// A script becomes visible through `main.scripts` only when instantiated by
+    /// [`Self::load_component`] or [`Self::load_scene_components`].
     pub fn load_script_source(
         &mut self,
         id: &Path,
@@ -256,6 +269,7 @@ impl LuaRuntime {
             editor_script,
             &Default::default(),
             None,
+            false,
         )
     }
 
@@ -266,6 +280,7 @@ impl LuaRuntime {
         editor_script: &EditorScript,
         component_bindings: &crate::component::ComponentBindings,
         scope: Option<HandleToken>,
+        register_in_main: bool,
     ) -> mlua::Result<()> {
         if !editor_script.enabled {
             return Ok(());
@@ -301,13 +316,18 @@ impl LuaRuntime {
             destroy: Self::method_key(&self.lua, &instance, "on_destroy")?,
             instance: self.lua.create_registry_value(instance)?,
             scope,
+            registered_in_main: register_in_main,
             id: self.next_script_id,
         };
         self.next_script_id = self.next_script_id.saturating_add(1);
         let has_update = entry.update.is_some();
-        self.register_script_instance(id, &self.lua.registry_value(&entry.instance)?)?;
+        if register_in_main {
+            self.register_script_instance(id, &self.lua.registry_value(&entry.instance)?)?;
+        }
         if let Err(error) = self.call_no_arg(&entry, entry.awake.as_ref()) {
-            self.remove_script_instance(id)?;
+            if register_in_main {
+                self.remove_script_instance(id)?;
+            }
             self.remove_instance_keys(entry)?;
             return Err(mlua::Error::runtime(format!(
                 "script path={} phase=on_awake error={error}",
@@ -517,6 +537,7 @@ impl LuaRuntime {
                 &component.editor_script,
                 &component.components,
                 None,
+                true,
             );
         }
         let resource = component.script.as_ref().ok_or_else(|| {
@@ -532,6 +553,7 @@ impl LuaRuntime {
             &component.editor_script,
             &component.components,
             None,
+            true,
         )
     }
 
@@ -595,6 +617,7 @@ impl LuaRuntime {
                 &component.editor_script,
                 &component.components,
                 scope,
+                true,
             );
         }
         let resource = component.script.as_ref().ok_or_else(|| {
@@ -610,6 +633,7 @@ impl LuaRuntime {
             &component.editor_script,
             &component.components,
             scope,
+            true,
         )
     }
 
@@ -683,8 +707,10 @@ impl LuaRuntime {
             {
                 first_error.get_or_insert(error);
             }
-            if let Err(error) = self.remove_script_instance(&entry.path) {
-                first_error.get_or_insert(error);
+            if entry.registered_in_main {
+                if let Err(error) = self.remove_script_instance(&entry.path) {
+                    first_error.get_or_insert(error);
+                }
             }
             if let Err(error) = self.remove_instance_keys(entry) {
                 first_error.get_or_insert(error);
@@ -829,12 +855,18 @@ return Main"#,
         config.script_root = root.clone();
         let mut runtime = LuaRuntime::new_for_scene(config, Api { bridge }).unwrap();
         runtime
-            .load_script_source(
-                Path::new("tracked.lua"),
-                r#"local Script = {}; Script.__index = Script
+            .load_component(
+                &LuaComponent {
+                    script: None,
+                    source_override: r#"local Script = {}; Script.__index = Script
 function Script.new(class) return setmetatable({ value = 42 }, class) end
-return Script"#,
-                &EditorScript::default(),
+return Script"#
+                        .into(),
+                    enabled: true,
+                    editor_script: EditorScript::default(),
+                    components: Default::default(),
+                },
+                Path::new("tracked.lua"),
             )
             .unwrap();
         runtime.start().unwrap();
@@ -849,6 +881,38 @@ return Script"#,
             .globals()
             .get::<bool>("main_scripts_empty")
             .unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_script_load_is_not_registered_in_main_scripts() {
+        let root =
+            std::env::temp_dir().join(format!("lua-main-direct-script-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("main.lua"),
+            r#"local Main = {}; function Main:start()
+    _G.direct_script_registered = self.scripts["direct.lua"] ~= nil
+end; return Main"#,
+        )
+        .unwrap();
+        let mut config = LuaConfig::default();
+        config.script_root = root.clone();
+        let mut runtime = LuaRuntime::new_for_scene(config, test_api()).unwrap();
+        runtime
+            .load_script_source(
+                Path::new("direct.lua"),
+                r#"local Script = {}; function Script.new(class) return class end; return Script"#,
+                &EditorScript::default(),
+            )
+            .unwrap();
+        runtime.start().unwrap();
+        assert!(!runtime
+            .lua
+            .globals()
+            .get::<bool>("direct_script_registered")
+            .unwrap());
+        runtime.destroy().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 

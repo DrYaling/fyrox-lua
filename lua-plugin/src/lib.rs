@@ -11,7 +11,6 @@ mod plugin;
 mod resource;
 mod runtime;
 mod scene;
-mod script_files;
 mod ui;
 mod value_bindings;
 
@@ -72,6 +71,7 @@ return C"#,
             ..Default::default()
         };
         let mut rt = LuaRuntime::new(config, Api).unwrap();
+        rt.load_script(&file).unwrap();
         rt.start().unwrap();
         rt.call_all("update", 0.5).unwrap();
         rt.dispatch_script_event("x", "y").unwrap();
@@ -93,7 +93,8 @@ return C"#,
             binding_mode: BindingMode::PackageFull,
             ..Default::default()
         };
-        assert!(LuaRuntime::new(c, Api).is_ok());
+        let mut runtime = LuaRuntime::new(c, Api).unwrap();
+        runtime.load_script(&dir.join("bad.lua")).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -125,7 +126,7 @@ return Main"#,
             Api,
         )
         .unwrap();
-        assert_eq!(runtime.script_count(), 1);
+        assert_eq!(runtime.script_count(), 0);
         assert_eq!(runtime.lua.globals().get::<u32>("main_awake").unwrap(), 1);
         runtime.start().unwrap();
         runtime.call_all("update", 0.25).unwrap();
@@ -133,6 +134,47 @@ return Main"#,
         assert_eq!(runtime.lua.globals().get::<f32>("main_dt").unwrap(), 0.25);
         runtime.destroy().unwrap();
         assert_eq!(runtime.lua.globals().get::<u32>("main_destroy").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreferenced_lua_file_is_not_instantiated_or_registered() {
+        let dir =
+            std::env::temp_dir().join(format!("fwok-lua-unreferenced-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.lua"),
+            "local M={}; function M:on_awake() _G.main_awake=true end; return M",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("unused.lua"),
+            "_G.unused_loaded = (_G.unused_loaded or 0) + 1; local C={}; function C.new(class) _G.unused_instantiated=true; return class end; return C",
+        )
+        .unwrap();
+        let runtime = LuaRuntime::new(
+            LuaConfig {
+                script_root: dir.clone(),
+                ..Default::default()
+            },
+            Api,
+        )
+        .unwrap();
+        assert!(runtime.lua.globals().get::<bool>("main_awake").unwrap());
+        assert_eq!(
+            runtime
+                .lua
+                .globals()
+                .get::<u32>("unused_loaded")
+                .unwrap_or(0),
+            0
+        );
+        assert!(!runtime
+            .lua
+            .globals()
+            .get::<bool>("unused_instantiated")
+            .unwrap_or(false));
+        assert_eq!(runtime.script_count(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -159,12 +201,52 @@ return Main"#,
             Api,
         )
         .unwrap();
+        runtime.load_script(&dir.join("consumer.lua")).unwrap();
         runtime.start().unwrap();
         assert_eq!(
             runtime.lua.globals().get::<i64>("require_result").unwrap(),
             42
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_uses_configured_script_root_for_component_loading() {
+        let root =
+            std::env::temp_dir().join(format!("fwok-lua-import-root-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("modules")).unwrap();
+        std::fs::write(
+            root.join("main.lua"),
+            "local Main={}; function Main:start() _G.main_started=true end; return Main",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("modules/helper.lua"),
+            "return { value = 'configured-root' }",
+        )
+        .unwrap();
+        let mut runtime = LuaRuntime::new(
+            LuaConfig {
+                script_root: root.clone(),
+                ..Default::default()
+            },
+            Api,
+        )
+        .unwrap();
+        let component = LuaComponent {
+            source_override: "local C={}; C.__index=C; local m=import('modules.helper'); function C.new(class) return setmetatable({value=m.value},class) end; function C:on_awake() _G.import_value=self.value end; return C".into(),
+            ..Default::default()
+        };
+        runtime
+            .load_component(&component, std::path::Path::new("component"))
+            .unwrap();
+        runtime.start().unwrap();
+        assert_eq!(
+            runtime.lua.globals().get::<String>("import_value").unwrap(),
+            "configured-root"
+        );
+        assert!(runtime.lua.globals().get::<bool>("main_started").unwrap());
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn editor_feature_controls_effective_mode() {
@@ -181,11 +263,18 @@ return Main"#,
     }
     #[test]
     fn missing_mode_uses_editor_default() {
-        let c: LuaConfig = toml::from_str(
-            "script_root='data/scripts'\nenabled=true",
-        )
-        .unwrap();
+        let c: LuaConfig = toml::from_str("script_root='data/scripts'\nenabled=true").unwrap();
         assert_eq!(c.binding_mode, BindingMode::EditorReflection);
+    }
+
+    #[test]
+    fn missing_config_uses_data_scripts_as_search_root() {
+        let path =
+            std::env::temp_dir().join(format!("fwok-lua-config-missing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let config = LuaConfig::load(&path).unwrap();
+        assert_eq!(config.script_root, std::path::PathBuf::from("data/scripts"));
+        assert!(config.enabled);
     }
 
     #[test]
