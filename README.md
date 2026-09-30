@@ -2,9 +2,9 @@
 
 ## Scope
 
-This repository contains the standalone Lua runtime plugin and offline Lua tooling used by FWOK. It does not contain game-specific gameplay code. The workspace is resolved from the sibling `Fyrox` checkout when used inside FWOK.
+This repository contains the standalone Lua runtime plugin and offline Lua tooling used by FWOK. It does not contain game-specific gameplay code. The workspace resolves Fyrox from `https://github.com/DrYaling/Fyrox.git` on the `master` branch.
 
-本仓库包含 FWOK 使用的独立 Lua 运行时插件和离线 Lua 工具，不包含具体游戏逻辑。在 FWOK 主工程中使用时，Fyrox 引擎依赖解析到相邻的 `Fyrox` 源码目录。
+本仓库包含 FWOK 使用的独立 Lua 运行时插件和离线 Lua 工具，不包含具体游戏逻辑。工作区从 `https://github.com/DrYaling/Fyrox.git` 的 `master` 分支解析 Fyrox 引擎依赖。
 
 ## Covered Features / 功能范围
 
