@@ -50,6 +50,7 @@ pub struct BindingRegistry {
     types: BTreeMap<&'static str, BindingType>,
 }
 
+#[allow(dead_code)]
 impl BindingRegistry {
     pub fn register_type(&mut self, binding: BindingType) -> Result<(), String> {
         if self.types.insert(binding.name, binding).is_some() {

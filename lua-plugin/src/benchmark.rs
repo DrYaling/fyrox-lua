@@ -1,5 +1,6 @@
 use crate::{SceneCommand, ScopedNodeName, UiCommand};
-use std::time::{Duration, Instant};
+use fyrox::core::instant::Instant;
+use std::{rc::Rc, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BenchmarkMetric {
@@ -28,7 +29,7 @@ fn metric(start: Instant, checksum: f64) -> BenchmarkMetric {
     BenchmarkMetric {
         iterations: 1000,
         elapsed: start.elapsed(),
-        checksum,
+        checksum: checksum as f64,
     }
 }
 
@@ -47,7 +48,7 @@ pub fn run_rust_baseline() -> RustBenchmarkReport {
     let mut checksum = 0.0;
     let target = ScopedNodeName {
         scope: None,
-        name: "BoxA".into(),
+        name: Rc::from("BoxA"),
     };
     let mut scene_commands = Vec::with_capacity(4_000);
     for i in 0..1000 {
@@ -101,40 +102,46 @@ pub fn run_rust_baseline() -> RustBenchmarkReport {
     for i in 0..1000 {
         enabled = !enabled;
         opacity = (i as f64 / 1000.0).fract();
-        ui_commands.push(UiCommand::SetText("hud_title".into(), format!("bench-{i}")));
-        ui_commands.push(UiCommand::SetVisible("hud_title".into(), enabled));
-        ui_commands.push(UiCommand::SetEnabled("send_button".into(), enabled));
+        ui_commands.push(UiCommand::SetText(
+            "benchmark_label".into(),
+            format!("bench-{i}"),
+        ));
+        ui_commands.push(UiCommand::SetVisible("benchmark_label".into(), enabled));
+        ui_commands.push(UiCommand::SetEnabled("benchmark_button".into(), enabled));
         ui_commands.push(UiCommand::SetWidth(
-            "hud_title".into(),
+            "benchmark_label".into(),
             200.0 + i as f32 % 10.0,
         ));
-        ui_commands.push(UiCommand::SetHeight("hud_title".into(), 30.0));
+        ui_commands.push(UiCommand::SetHeight("benchmark_label".into(), 30.0));
         ui_commands.push(UiCommand::SetPosition(
-            "hud_title".into(),
+            "benchmark_label".into(),
             i as f32 % 20.0,
             10.0,
         ));
-        ui_commands.push(UiCommand::SetChecked("demo_toggle".into(), enabled));
+        ui_commands.push(UiCommand::SetChecked("benchmark_toggle".into(), enabled));
         ui_commands.push(UiCommand::SetSelected(
-            "demo_selector".into(),
+            "benchmark_selector".into(),
             Some(i as usize % 2),
         ));
         ui_commands.push(UiCommand::SetScroll(
-            "demo_scroll_viewer".into(),
+            "benchmark_scroll".into(),
             0.0,
             i as f32 % 10.0,
         ));
         ui_commands.push(UiCommand::SetProgress(
-            "demo_progress".into(),
+            "benchmark_progress".into(),
             i as f32 / 1000.0,
         ));
-        ui_commands.push(UiCommand::SetOpacity("demo_image".into(), opacity as f32));
+        ui_commands.push(UiCommand::SetOpacity(
+            "benchmark_image".into(),
+            opacity as f32,
+        ));
         ui_commands.push(UiCommand::SetGridRow(
-            "demo_grid_child".into(),
+            "benchmark_grid_child".into(),
             i as usize % 2,
         ));
         ui_commands.push(UiCommand::SetColor(
-            "hud_title".into(),
+            "benchmark_label".into(),
             (i % 255) as f32 / 255.0,
             1.0 - (i % 255) as f32 / 255.0,
             0.5,
@@ -152,6 +159,72 @@ pub fn run_rust_baseline() -> RustBenchmarkReport {
         numeric,
         text: text_metric,
         widgets,
+    }
+}
+
+/// Measures the queued-command construction cost for a composite UI layout
+/// workload supplied by a host benchmark script.
+pub fn run_rust_ui_layout(iterations: u32) -> BenchmarkMetric {
+    let mut commands = Vec::with_capacity(iterations as usize);
+    let name: Rc<str> = Rc::from("status");
+    let mut checksum = 0.0_f64;
+    let mut samples = Vec::with_capacity(7);
+    for _ in 0..7 {
+        commands.clear();
+        let start = Instant::now();
+        for i in 0..iterations {
+            let x = (i % 100) as f32;
+            let y = (i % 10) as f32;
+            commands.push(UiCommand::SetLayout(
+                name.clone(),
+                x,
+                y,
+                100.0 + y,
+                20.0 + y,
+            ));
+            checksum += (x + y) as f64;
+        }
+        std::hint::black_box(&commands);
+        samples.push(start.elapsed());
+    }
+    samples.sort_unstable();
+    BenchmarkMetric {
+        iterations,
+        elapsed: samples[3],
+        checksum: checksum / 7.0,
+    }
+}
+
+/// Reference for the three-command path where each command allocates its target String.
+pub fn run_rust_ui_layout_legacy(iterations: u32) -> BenchmarkMetric {
+    #[allow(dead_code)]
+    enum LegacyUiCommand {
+        Position(String, f32, f32),
+        Width(String, f32),
+        Height(String, f32),
+    }
+    let mut commands = Vec::with_capacity(iterations as usize * 3);
+    let mut checksum = 0.0_f64;
+    let mut samples = Vec::with_capacity(7);
+    for _ in 0..7 {
+        commands.clear();
+        let start = Instant::now();
+        for i in 0..iterations {
+            let x = (i % 100) as f32;
+            let y = (i % 10) as f32;
+            commands.push(LegacyUiCommand::Position(String::from("status"), x, y));
+            commands.push(LegacyUiCommand::Width(String::from("status"), 100.0 + y));
+            commands.push(LegacyUiCommand::Height(String::from("status"), 20.0 + y));
+            checksum += (x + y) as f64;
+        }
+        std::hint::black_box(&commands);
+        samples.push(start.elapsed());
+    }
+    samples.sort_unstable();
+    BenchmarkMetric {
+        iterations,
+        elapsed: samples[3],
+        checksum: checksum / 7.0,
     }
 }
 
@@ -175,5 +248,15 @@ mod tests {
         }
         assert_eq!(report.event.checksum, 249_750.0);
         assert_eq!(report.text.checksum, 10_900.0);
+    }
+
+    #[test]
+    fn shared_name_layout_benchmark_preserves_workload_checksum() {
+        let legacy = run_rust_ui_layout_legacy(40);
+        let optimized = run_rust_ui_layout(40);
+        assert_eq!(legacy.iterations, optimized.iterations);
+        assert_eq!(legacy.checksum, optimized.checksum);
+        assert!(legacy.elapsed.as_nanos() > 0);
+        assert!(optimized.elapsed.as_nanos() > 0);
     }
 }

@@ -1,6 +1,5 @@
 //! Generic scene-node lookup cache owned by the main thread.
 
-use crate::game_api::ScopedNodeName;
 use crate::handles::HandleToken;
 use fyrox::{
     core::pool::Handle,
@@ -11,7 +10,9 @@ use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct SceneRegistry {
-    nodes: HashMap<ScopedNodeName, Handle<Node>>,
+    // Split the scope from the name so hot-path lookups can borrow `&str`
+    // without constructing a temporary Rc-backed key.
+    nodes: HashMap<Option<HandleToken>, HashMap<String, Handle<Node>>>,
 }
 
 impl SceneRegistry {
@@ -27,21 +28,19 @@ impl SceneRegistry {
         root: Option<Handle<Node>>,
         name: &str,
     ) -> Option<Handle<Node>> {
-        let key = ScopedNodeName {
-            scope: root.map(HandleToken::from_handle),
-            name: name.to_owned(),
-        };
-        if let Some(handle) = self.nodes.get(&key).copied() {
+        let scope = root.map(HandleToken::from_handle);
+        let scoped = self.nodes.entry(scope).or_default();
+        if let Some(handle) = scoped.get(name).copied() {
             if scene.graph.try_get(handle).is_ok() {
                 return Some(handle);
             }
-            self.nodes.remove(&key);
+            scoped.remove(name);
         }
         let (handle, _) = match root {
             Some(root) => scene.graph.find(root, &mut |node| node.name() == name)?,
             None => scene.graph.find_by_name_from_root(name)?,
         };
-        self.nodes.insert(key, handle);
+        scoped.insert(name.to_owned(), handle);
         Some(handle)
     }
 
@@ -57,7 +56,7 @@ impl SceneRegistry {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.values().map(HashMap::len).sum()
     }
 }
 

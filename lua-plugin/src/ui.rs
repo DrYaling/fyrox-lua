@@ -2,7 +2,7 @@
 //!
 //! This module intentionally knows no game-specific IDs. The host registers arbitrary named
 //! engine nodes, while Lua resolves and operates them through userdata.
-use crate::game_api::{LuaLogLevel, UiCommand, UiElementKind, UiElementSpec};
+use crate::game_api::{Bridge, LuaLogLevel, SharedName, UiCommand, UiElementKind, UiElementSpec};
 use crate::handles::HandleToken;
 use fyrox::core::algebra::Vector2;
 use fyrox::core::color::Color;
@@ -26,6 +26,7 @@ use fyrox::{
     },
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UiComponent {
@@ -68,6 +69,32 @@ pub struct UiRegistry {
 }
 
 impl UiRegistry {
+    /// Strict prefab binding for hosts that require a serialized UI contract.
+    pub fn apply_checked(
+        &mut self,
+        ui: &mut UserInterface,
+        command: UiCommand,
+    ) -> Result<(), String> {
+        if let UiCommand::ResolveRequired(id) = command {
+            let count = ui
+                .nodes()
+                .pair_iter()
+                .filter(|(_, node)| node.name() == id.as_ref())
+                .count();
+            return match count {
+                1 if self.resolve(ui, id.as_ref()).is_some() => Ok(()),
+                0 => Err(format!("required UI prefab node is missing: {id}")),
+                1 => Err(format!(
+                    "required UI prefab node could not be resolved: {id}"
+                )),
+                _ => Err(format!(
+                    "required UI prefab node name is duplicated: {id} ({count} matches)"
+                )),
+            };
+        }
+        self.apply(ui, command);
+        Ok(())
+    }
     pub fn create(&mut self, ui: &mut UserInterface, spec: UiElementSpec) {
         let ctx = &mut ui.build_ctx();
         let widget = WidgetBuilder::new()
@@ -148,7 +175,7 @@ impl UiRegistry {
             self.button_names.remove(&previous.to_base());
         }
         if let UiComponent::Button(button) = component {
-            self.button_names.insert(button.to_base(), id);
+            self.button_names.insert(button.to_base(), id.clone());
         }
     }
 
@@ -179,7 +206,10 @@ impl UiRegistry {
         }
     }
 
-    pub fn sync_text_values(&self, ui: &UserInterface, values: &mut HashMap<String, String>) {
+    /// 将尚未建立缓存的文本从引擎同步到 bridge。
+    ///
+    /// 已存在的值由 Lua 命令队列维护，不能在 UI 消息尚未消费时被引擎中的旧值覆盖。
+    pub fn sync_text_values(&self, ui: &UserInterface, bridge: &mut Bridge) {
         for (id, component) in &self.components {
             let value = match component {
                 UiComponent::Text(handle) => ui.try_get(*handle).ok().map(Text::text),
@@ -188,16 +218,72 @@ impl UiRegistry {
                 _ => None,
             };
             if let Some(value) = value {
-                values.insert(id.clone(), value);
+                bridge.sync_ui_text_value(id, value);
             }
         }
     }
 
     pub fn apply(&mut self, ui: &mut UserInterface, command: UiCommand) {
+        self.apply_batch(ui, std::iter::once(command));
+    }
+
+    /// Applies commands in order while reusing the last resolved target. The
+    /// cache is local to this call so reloads and dynamic IDs cannot leave
+    /// stale handles or retained identifiers behind.
+    pub fn apply_batch(
+        &mut self,
+        ui: &mut UserInterface,
+        commands: impl IntoIterator<Item = UiCommand>,
+    ) {
+        self.apply_batch_with_text_values(ui, commands, &HashMap::new());
+    }
+
+    /// 按命令顺序应用 UI 修改，并使用宿主提供的最新文本作为 append 基线。
+    ///
+    /// Fyrox 的 `send` 是异步消息队列。若上一帧的文本消息尚未被 UI 消费，直接从节点
+    /// 读取会得到旧值；宿主缓存因此必须在本批次开始前传入，避免跨帧 append 丢失内容。
+    pub fn apply_batch_with_text_values(
+        &mut self,
+        ui: &mut UserInterface,
+        commands: impl IntoIterator<Item = UiCommand>,
+        baseline: &HashMap<String, String>,
+    ) {
+        let mut last_target: Option<(SharedName, Option<UiComponent>)> = None;
+        let mut text_values: HashMap<SharedName, String> = HashMap::new();
+        for command in commands {
+            self.apply_cached(ui, command, &mut last_target, &mut text_values, baseline);
+        }
+    }
+
+    #[inline]
+    fn resolve_cached(
+        &mut self,
+        ui: &UserInterface,
+        id: &SharedName,
+        last_target: &mut Option<(SharedName, Option<UiComponent>)>,
+    ) -> Option<UiComponent> {
+        if let Some((cached_id, component)) = last_target.as_ref() {
+            if Rc::ptr_eq(cached_id, id) || cached_id.as_ref() == id.as_ref() {
+                return *component;
+            }
+        }
+        let component = self.resolve(ui, id.as_ref());
+        *last_target = Some((id.clone(), component));
+        component
+    }
+
+    pub(crate) fn apply_cached(
+        &mut self,
+        ui: &mut UserInterface,
+        command: UiCommand,
+        last_target: &mut Option<(SharedName, Option<UiComponent>)>,
+        text_values: &mut HashMap<SharedName, String>,
+        baseline: &HashMap<String, String>,
+    ) {
         match command {
             UiCommand::Load(_) | UiCommand::Show(_) => {}
             UiCommand::Resolve(id) => {
-                if self.resolve(ui, &id).is_some() {
+                if self.resolve_cached(ui, &id, last_target).is_some() {
                     fyrox::core::log::Log::info(format!(
                         "[Lua] ui.find resolved existing UI node: {id}"
                     ));
@@ -207,43 +293,96 @@ impl UiRegistry {
                     ));
                 }
             }
-            UiCommand::Create(spec) => self.create(ui, spec),
-            UiCommand::SetText(id, value) => match self.resolve(ui, &id) {
-                Some(UiComponent::Text(handle)) => ui.send(handle, TextMessage::Text(value)),
-                Some(UiComponent::TextBox(handle)) => ui.send(handle, TextMessage::Text(value)),
+            UiCommand::ResolveRequired(id) => {
+                if let Err(error) = self.apply_checked(ui, UiCommand::ResolveRequired(id)) {
+                    fyrox::core::log::Log::err(format!("[Lua] {error}"));
+                }
+            }
+            UiCommand::Create(spec) => {
+                self.create(ui, spec);
+                *last_target = None;
+            }
+            UiCommand::SetText(id, value) => match self.resolve_cached(ui, &id, last_target) {
+                Some(UiComponent::Text(handle)) => {
+                    text_values.insert(id, value.clone());
+                    ui.send(handle, TextMessage::Text(value))
+                }
+                Some(UiComponent::TextBox(handle)) => {
+                    text_values.insert(id, value.clone());
+                    ui.send(handle, TextMessage::Text(value))
+                }
                 Some(UiComponent::Button(handle)) => {
+                    text_values.insert(id, value.clone());
                     ui.send(handle, ButtonMessage::Content(ButtonContent::text(value)))
                 }
                 _ => {}
             },
-            UiCommand::Append(id, value) => match self.resolve(ui, &id) {
+            UiCommand::SetLayout(id, x, y, width, height) => {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
+                    let handle = component.handle();
+                    ui.send(handle, WidgetMessage::DesiredPosition(Vector2::new(x, y)));
+                    ui.send(handle, WidgetMessage::Width(width));
+                    ui.send(handle, WidgetMessage::Height(height));
+                }
+            }
+            UiCommand::SetTint(id, r, g, b, a, opacity) => {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
+                    let handle = component.handle();
+                    ui.send(
+                        handle,
+                        WidgetMessage::Foreground(
+                            Brush::Solid(Color::from_rgba(
+                                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                                (b.clamp(0.0, 1.0) * 255.0) as u8,
+                                (a.clamp(0.0, 1.0) * 255.0) as u8,
+                            ))
+                            .into(),
+                        ),
+                    );
+                    ui.send(handle, WidgetMessage::Opacity(Some(opacity)));
+                }
+            }
+            UiCommand::Append(id, value) => match self.resolve_cached(ui, &id, last_target) {
                 Some(UiComponent::Text(handle)) => {
-                    let current = ui.try_get(handle).map(Text::text).unwrap_or_default();
-                    ui.send(handle, TextMessage::Text(format!("{current}{value}")));
+                    let cached_text = baseline.get(id.as_ref()).cloned();
+                    let current = text_values.entry(id).or_insert_with(|| {
+                        cached_text.unwrap_or_else(|| {
+                            ui.try_get(handle).map(Text::text).unwrap_or_default()
+                        })
+                    });
+                    current.push_str(&value);
+                    ui.send(handle, TextMessage::Text(current.clone()));
                 }
                 Some(UiComponent::TextBox(handle)) => {
-                    let current = ui.try_get(handle).map(TextBox::text).unwrap_or_default();
-                    ui.send(handle, TextMessage::Text(format!("{current}{value}")));
+                    let cached_text = baseline.get(id.as_ref()).cloned();
+                    let current = text_values.entry(id).or_insert_with(|| {
+                        cached_text.unwrap_or_else(|| {
+                            ui.try_get(handle).map(TextBox::text).unwrap_or_default()
+                        })
+                    });
+                    current.push_str(&value);
+                    ui.send(handle, TextMessage::Text(current.clone()));
                 }
                 _ => {}
             },
-            UiCommand::SetVisible(id, visible) => match self.resolve(ui, &id) {
+            UiCommand::SetVisible(id, visible) => match self.resolve_cached(ui, &id, last_target) {
                 Some(component) => ui.send(component.handle(), WidgetMessage::Visibility(visible)),
                 _ => {}
             },
-            UiCommand::SetEnabled(id, enabled) => match self.resolve(ui, &id) {
+            UiCommand::SetEnabled(id, enabled) => match self.resolve_cached(ui, &id, last_target) {
                 Some(component) => ui.send(component.handle(), WidgetMessage::Enabled(enabled)),
                 _ => {}
             },
-            UiCommand::SetWidth(id, width) => match self.resolve(ui, &id) {
+            UiCommand::SetWidth(id, width) => match self.resolve_cached(ui, &id, last_target) {
                 Some(component) => ui.send(component.handle(), WidgetMessage::Width(width)),
                 _ => {}
             },
-            UiCommand::SetHeight(id, height) => match self.resolve(ui, &id) {
+            UiCommand::SetHeight(id, height) => match self.resolve_cached(ui, &id, last_target) {
                 Some(component) => ui.send(component.handle(), WidgetMessage::Height(height)),
                 _ => {}
             },
-            UiCommand::SetPosition(id, x, y) => match self.resolve(ui, &id) {
+            UiCommand::SetPosition(id, x, y) => match self.resolve_cached(ui, &id, last_target) {
                 Some(component) => ui.send(
                     component.handle(),
                     WidgetMessage::DesiredPosition(Vector2::new(x, y)),
@@ -251,16 +390,20 @@ impl UiRegistry {
                 _ => {}
             },
             UiCommand::SetChecked(id, value) => {
-                if let Some(UiComponent::CheckBox(handle)) = self.resolve(ui, &id) {
+                if let Some(UiComponent::CheckBox(handle)) =
+                    self.resolve_cached(ui, &id, last_target)
+                {
                     ui.send(handle, CheckBoxMessage::Check(Some(value)));
                 }
             }
             UiCommand::SetSelected(id, value) => {
-                if let Some(UiComponent::DropdownList(handle)) = self.resolve(ui, &id) {
+                if let Some(UiComponent::DropdownList(handle)) =
+                    self.resolve_cached(ui, &id, last_target)
+                {
                     ui.send(handle, DropdownListMessage::Selection(value));
                 }
             }
-            UiCommand::SetScroll(id, x, y) => match self.resolve(ui, &id) {
+            UiCommand::SetScroll(id, x, y) => match self.resolve_cached(ui, &id, last_target) {
                 Some(UiComponent::ScrollPanel(handle)) => {
                     ui.send(handle, ScrollPanelMessage::HorizontalScroll(x));
                     ui.send(handle, ScrollPanelMessage::VerticalScroll(y));
@@ -272,12 +415,15 @@ impl UiRegistry {
                 _ => {}
             },
             UiCommand::SetProgress(id, value) => {
-                if let Some(UiComponent::ProgressBar(handle)) = self.resolve(ui, &id) {
+                if let Some(UiComponent::ProgressBar(handle)) =
+                    self.resolve_cached(ui, &id, last_target)
+                {
                     ui.send(handle, ProgressBarMessage::Progress(value));
                 }
             }
             UiCommand::SetPopupOpen(id, open) => {
-                if let Some(UiComponent::Popup(handle)) = self.resolve(ui, &id) {
+                if let Some(UiComponent::Popup(handle)) = self.resolve_cached(ui, &id, last_target)
+                {
                     ui.send(
                         handle,
                         if open {
@@ -289,22 +435,22 @@ impl UiRegistry {
                 }
             }
             UiCommand::SetOpacity(id, value) => {
-                if let Some(component) = self.resolve(ui, &id) {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
                     ui.send(component.handle(), WidgetMessage::Opacity(Some(value)));
                 }
             }
             UiCommand::SetGridRow(id, value) => {
-                if let Some(component) = self.resolve(ui, &id) {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
                     ui.send(component.handle(), WidgetMessage::Row(value));
                 }
             }
             UiCommand::SetGridColumn(id, value) => {
-                if let Some(component) = self.resolve(ui, &id) {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
                     ui.send(component.handle(), WidgetMessage::Column(value));
                 }
             }
             UiCommand::SetColor(id, r, g, b, a) => {
-                if let Some(component) = self.resolve(ui, &id) {
+                if let Some(component) = self.resolve_cached(ui, &id, last_target) {
                     ui.send(
                         component.handle(),
                         WidgetMessage::Foreground(
@@ -325,5 +471,82 @@ impl UiRegistry {
                 LuaLogLevel::Error => fyrox::core::log::Log::err(format!("[LuaScript] {message}")),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod strict_binding_tests {
+    use super::*;
+
+    #[test]
+    fn required_prefab_node_must_exist_once() {
+        let mut ui = UserInterface::new(Vector2::new(320.0, 200.0));
+        for _ in 0..2 {
+            let node = TextBuilder::new(WidgetBuilder::new().with_name("duplicated"))
+                .with_text("test")
+                .build(&mut ui.build_ctx());
+            ui.link_nodes(node.to_base::<UiNode>(), ui.root(), false);
+        }
+        let node = TextBuilder::new(WidgetBuilder::new().with_name("present"))
+            .with_text("test")
+            .build(&mut ui.build_ctx());
+        ui.link_nodes(node.to_base::<UiNode>(), ui.root(), false);
+        let mut registry = UiRegistry::default();
+        assert!(registry
+            .apply_checked(&mut ui, UiCommand::ResolveRequired("present".into()))
+            .is_ok());
+        assert!(registry
+            .apply_checked(&mut ui, UiCommand::ResolveRequired("missing".into()))
+            .unwrap_err()
+            .contains("missing"));
+        assert!(registry
+            .apply_checked(&mut ui, UiCommand::ResolveRequired("duplicated".into()))
+            .unwrap_err()
+            .contains("duplicated"));
+    }
+
+    #[test]
+    fn batch_text_append_uses_previous_queued_value() {
+        let mut ui = UserInterface::new(Vector2::new(320.0, 200.0));
+        let node = TextBuilder::new(WidgetBuilder::new().with_name("title"))
+            .with_text("initial")
+            .build(&mut ui.build_ctx());
+        ui.link_nodes(node.to_base::<UiNode>(), ui.root(), false);
+        let mut registry = UiRegistry::default();
+        registry.apply_batch(
+            &mut ui,
+            [
+                UiCommand::SetText("title".into(), "a".into()),
+                UiCommand::Append("title".into(), "b".into()),
+                UiCommand::SetText("title".into(), "c".into()),
+                UiCommand::Append("title".into(), "d".into()),
+            ],
+        );
+        while ui.poll_message().is_some() {}
+        assert_eq!(registry.read_text(&mut ui, "title").as_deref(), Some("cd"));
+    }
+
+    #[test]
+    fn cross_frame_append_uses_cached_text_before_ui_messages_are_consumed() {
+        let mut ui = UserInterface::new(Vector2::new(320.0, 200.0));
+        let node = TextBuilder::new(WidgetBuilder::new().with_name("title"))
+            .with_text("initial")
+            .build(&mut ui.build_ctx());
+        ui.link_nodes(node.to_base::<UiNode>(), ui.root(), false);
+        let mut registry = UiRegistry::default();
+        registry.apply_batch_with_text_values(
+            &mut ui,
+            [UiCommand::SetText("title".into(), "a".into())],
+            &HashMap::new(),
+        );
+
+        let baseline = HashMap::from([(String::from("title"), String::from("a"))]);
+        registry.apply_batch_with_text_values(
+            &mut ui,
+            [UiCommand::Append("title".into(), "b".into())],
+            &baseline,
+        );
+        while ui.poll_message().is_some() {}
+        assert_eq!(registry.read_text(&mut ui, "title").as_deref(), Some("ab"));
     }
 }
